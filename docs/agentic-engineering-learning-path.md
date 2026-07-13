@@ -31,21 +31,306 @@
 
 > **Non-negotiable foundation.** Before writing a single agent, understand the underlying model.
 
-| Concept | Why it matters |
-|---|---|
-| **Transformer architecture** | Mental model for attention, context limits, and why order matters |
-| **Tokenization** | Why punctuation costs tokens; understanding token boundaries matters for prompts and cost |
-| **Sampling parameters** | Temperature, top-p — what "stochastic" means for agent reliability |
-| **Training objectives** | Why models predict tokens; how RLHF shapes behavior; why models can be confidently wrong |
-| **Context window as working memory** | What happens when context fills; models attend better to start and end than the middle ("lost in the middle" effect) |
-
 **Why these concepts are durable:** Every new model is still a transformer. These won't expire.
+
+At the core, an LLM does one thing: **given everything before it, predict the next token**. All reasoning, coding, and conversation emerges from doing that one thing at enormous scale on enormous data.
+
+```
+Input:  "The capital of France is"
+Model:  (calculates probabilities over entire vocabulary)
+Output: "Paris"   ← highest probability next token
+```
+
+Everything else in this section explains the mechanics behind that prediction and why those mechanics create specific failure modes that directly affect how you build agents.
+
+---
+
+### 1.1 Transformer Architecture
+
+**Analogy:** Imagine reading a sentence and being able to instantly highlight which other words are relevant to understanding each word — not just nearby words, but any word anywhere in the text. That highlighting is what attention does.
+
+```
+Sentence: "The bank by the river was steep"
+
+To understand "bank":
+  river  ──── HIGH attention ────► bank   (river disambiguates bank = riverbank)
+  steep  ──── MED  attention ────► bank
+  The    ──── LOW  attention ────► bank
+```
+
+A transformer processes all tokens in your input **simultaneously** and, for each token, computes how much to attend to every other token. This produces a rich, context-aware representation before any prediction happens.
+
+Introduced in *"Attention Is All You Need"* (Vaswani et al., 2017), the transformer replaced sequential recurrence (RNNs/LSTMs) with **attention** as the sole mechanism for relating tokens — this is what unlocked massive parallelism and scale.
+
+#### The full stack, bottom to top
+
+```
+Input text
+   │
+   ▼
+┌────────────────────────┐
+│ Tokenization           │  "The cat sat" → IDs [464, 3797, 3332]
+└────────────────────────┘
+   │
+   ▼
+┌────────────────────────┐
+│ Token Embedding        │  each ID → learned vector of size d_model (e.g. 768)
+│ + Positional Encoding  │  inject order (attention alone is order-blind)
+└────────────────────────┘
+   │
+   ▼
+┌────────────────────────────────────┐
+│      N × Transformer Blocks         │  stacked (e.g. 12 / 24 / 96 layers)
+│  ┌──────────────────────────────┐  │
+│  │ Multi-Head Self-Attention    │  │  tokens exchange information
+│  │ + Residual + LayerNorm       │  │
+│  ├──────────────────────────────┤  │
+│  │ Feed-Forward Network (MLP)    │  │  per-token processing
+│  │ + Residual + LayerNorm       │  │
+│  └──────────────────────────────┘  │
+└────────────────────────────────────┘
+   │
+   ▼
+┌────────────────────────┐
+│ Final LayerNorm        │
+│ + Linear → vocabulary  │  produce logits over every token in vocab
+│ + Softmax              │  → probability distribution for the next token
+└────────────────────────┘
+   │
+   ▼
+Next-token probabilities
+```
+
+#### Step 1 — Embedding + Positional Encoding
+
+Tokens are integers; the model needs continuous vectors it can do math on.
+
+- **Token embedding** — a lookup table of shape `[vocab_size, d_model]`; each token ID maps to a learned vector.
+- **Positional encoding** — attention is **permutation-invariant**: on its own it sees a *bag* of tokens, not an ordered sequence. Position must be added explicitly (fixed sinusoids in the original paper; modern LLMs mostly use **rotary embeddings / RoPE**, which extend better to long contexts).
+
+```
+final_input = token_embedding(id) + positional_encoding(position)
+```
+
+#### Step 2 — Self-Attention (Q, K, V)
+
+Each token asks: *"which other tokens should I pay attention to, and how much?"* From every token's vector, three projections are computed via learned matrices `W_Q`, `W_K`, `W_V`:
+
+| Vector | Role | Analogy |
+|---|---|---|
+| **Query (Q)** | what this token is looking for | a search query |
+| **Key (K)** | what this token advertises | a document's index tag |
+| **Value (V)** | the information this token carries | the document's content |
+
+**Scaled dot-product attention:**
+
+```
+Attention(Q, K, V) = softmax( (Q · Kᵀ) / √d_k ) · V
+
+  1. Q · Kᵀ        → relevance score of every token to every other token
+  2. ÷ √d_k        → scale down so softmax doesn't saturate
+  3. softmax       → turn scores into weights that sum to 1
+  4. × V           → weighted blend of every token's information
+```
+
+**Multi-head attention** runs this many times in parallel with independent `W_Q/W_K/W_V` sets ("heads"). Each head learns a different relationship — one may track syntax, another long-range references — and the results are concatenated. One head is a single lens; multiple heads see multiple kinds of relationship at once.
+
+> **Causal masking:** In generative (decoder-only) LLMs, a token may only attend to tokens *before* it — future positions are masked out. This is what makes left-to-right next-token prediction possible.
+
+#### Step 3 — Feed-Forward Network (FFN)
+
+After attention mixes information *across* tokens, a small MLP processes *each token independently* (expand → non-linearity → project back). Attention decides **what to combine**; the FFN decides **what to make of it**.
+
+#### Step 4 — Residuals, LayerNorm, and stacking
+
+Each sub-layer is wrapped as `output = LayerNorm(x + SubLayer(x))`:
+
+- **Residual connections** (`x +`) let gradients flow through very deep stacks without vanishing — the reason 96-layer models train at all.
+- **LayerNorm** keeps activations numerically stable across layers.
+
+Stacking N of these blocks lets the model build understanding in layers — early layers capture surface patterns, deeper layers capture abstract meaning.
+
+#### Step 5 — Output projection
+
+The final token's vector is projected to vocabulary size and passed through softmax, yielding a probability for every possible next token. Sampling (§1.3) picks from that distribution.
+
+**The three things that matter for agent builders:**
+
+| Property | What it means in practice |
+|---|---|
+| **Order matters** | "Dog bites man" ≠ "Man bites dog" — position is encoded; shuffling tokens changes meaning |
+| **Attention is O(n²)** | Cost grows with the *square* of sequence length — doubling context roughly quadruples attention compute; this is why long context is expensive |
+| **Context window is a hard ceiling** | The transformer physically cannot see tokens outside its window — there is no fuzzy cutoff, just a cliff |
+| **Attention is uneven** | The model attends more strongly to the beginning and end of context; content in the middle gets diluted — the "lost in the middle" effect |
+
+---
+
+### 1.2 Tokenization
+
+**The model never sees words — it sees tokens.**
+
+A tokenizer breaks text into subword units before the model processes anything. Tokens are roughly 3–4 characters on average in English, but the boundaries are not intuitive.
+
+```
+"unhappiness"  →  ["un", "happi", "ness"]         3 tokens
+"ChatGPT"      →  ["Chat", "G", "PT"]              3 tokens
+"2024-01-15"   →  ["2024", "-", "01", "-", "15"]   5 tokens
+" hello"       →  [" hello"]                       1 token  (leading space is part of the token)
+```
+
+**Why `9.11 > 9.9` trips models:**
+
+The model sees `9`, `.`, `11` as separate tokens rather than a single numeric value — and its training data is full of contexts where "9.11" genuinely *is* greater than "9.9": version numbers, dates, chapter-and-verse references. So it reasons from token and context patterns instead of arithmetic, and frequently fails. How much of this is tokenization versus flawed numeric reasoning is genuinely debated — which is exactly what the exercise below asks you to probe.
+
+**Practical implications:**
+
+| Situation | Impact |
+|---|---|
+| Long system prompts | Each word costs tokens; verbose instructions eat into context budget |
+| Code and JSON | Punctuation (`{}`, `[]`, `""`) often tokenizes as individual tokens — structured output is expensive |
+| Non-English text | Many languages tokenize less efficiently; same content costs 2–3× more tokens |
+| Numbers and math | Unreliable — numbers are token sequences, not numeric values |
+
+---
+
+### 1.3 Sampling Parameters
+
+**The model produces a probability distribution, not a single answer.**
+
+After processing input, the model outputs a probability score for every token in its vocabulary. Sampling parameters control how you pick from that distribution.
+
+```
+Next token probabilities after "The sky is":
+  "blue"      → 42%
+  "clear"     → 28%
+  "dark"      → 15%
+  "beautiful" →  8%
+  ...others   →  7%
+```
+
+**Temperature** scales the distribution before sampling:
+
+```
+Temperature 0.0  →  always pick "blue"  (greedy — near-deterministic in practice)
+Temperature 0.7  →  "blue" most likely, others occasionally sampled
+Temperature 1.5  →  distribution flattened; rare tokens appear more often
+Temperature 2.0  →  nearly random; coherence breaks down
+```
+
+**Top-p (nucleus sampling)** cuts off the tail:
+
+```
+Top-p = 0.9  →  only sample from tokens that together cover 90% of probability mass
+             →  "blue"(42%) + "clear"(28%) + "dark"(15%) = 85%
+             →  add "beautiful"(8%) = 93% → stop here, exclude the rest
+```
+
+**What this means for agents:**
+
+| Setting | Use case | Risk |
+|---|---|---|
+| `temperature=0` | Deterministic tool routing, structured extraction | Can get stuck in repetitive loops |
+| `temperature=0.3–0.7` | Most agent reasoning tasks | Good balance of consistency and variety |
+| `temperature>1.0` | Creative tasks, brainstorming | Unreliable for factual tasks; hallucinations increase |
+
+> **Key insight:** An agent at `temperature=0` will make the same decision on identical input *almost* every time — but not guaranteed: floating-point rounding and server-side batching make real APIs only *near*-deterministic even at zero. At `temperature=0.7` it may route differently on identical inputs. This is not a bug — it is the stochastic nature of the model, and your reliability engineering (§10) must account for it.
+
+---
+
+### 1.4 Training Objectives
+
+**Why models predict tokens — and why that creates specific failure modes.**
+
+LLMs are trained in two stages:
+
+**Stage 1 — Pre-training (next-token prediction):**
+
+```
+Training signal:
+  Input:  "The Eiffel Tower is located in"
+  Target: "Paris"   ← model rewarded for this
+  Wrong:  "London"  ← model penalized
+```
+
+The model learns language, facts, and reasoning patterns — but also learns to produce *plausible-sounding* continuations. A confident-sounding completion is statistically rewarded whether it is factually correct or not. This is why models can be **confidently wrong**.
+
+**Stage 2 — Preference tuning (RLHF / DPO):**
+
+Human raters (or an AI proxy) score outputs for helpfulness, harmlessness, and honesty. The model is then fine-tuned toward outputs that score well — classically via RLHF (Reinforcement Learning from Human Feedback), though many modern models use lighter-weight variants like DPO or RLAIF. The mechanism differs; the effect is the same.
+
+```
+Preference tuning shapes toward:   Side effects:
+  ✓ Helpful responses          ✗ Sycophancy (agreeing to avoid conflict)
+  ✓ Following instructions     ✗ Over-refusal (unhelpful to avoid any risk)
+  ✓ Refusing harmful requests  ✗ Hedging on questions it could answer directly
+```
+
+**What this means for agents:**
+
+| Training artifact | Agent impact |
+|---|---|
+| Predicts plausible completions | Will hallucinate facts that "sound right" |
+| RLHF-tuned for agreeableness | Sycophancy — may agree with incorrect user feedback (see §10) |
+| Static training data | Knowledge has a cutoff; use RAG or tool calls for current facts (see §5) |
+| No explicit source memory | Cannot reliably cite sources or verify its own outputs |
+
+---
+
+### 1.5 Context Window as Working Memory
+
+**The context window is the model's only workspace.**
+
+Everything the model can reason over at any moment is exactly what is in the context window — nothing more. There is no background memory, no persistent state between calls unless you explicitly build it.
+
+```
+┌─────────────────────────────────────────────────────┐
+│                   CONTEXT WINDOW                    │
+│  ┌──────────────┐  ┌───────────┐  ┌─────────────┐  │
+│  │ System prompt│  │  History  │  │  New input  │  │
+│  │ (rules,tools,│  │(prev turns│  │+ tool result│  │
+│  │  identity)   │  │+ results) │  │             │  │
+│  └──────────────┘  └───────────┘  └─────────────┘  │
+│                                                     │
+│  Total: e.g. 200,000 tokens — when full, old        │
+│  content is silently dropped                        │
+└─────────────────────────────────────────────────────┘
+```
+
+**Three critical behaviors:**
+
+**1. Recency bias** — content near the end of context receives stronger attention. Instructions at the very top (system prompt) are anchored well; instructions buried mid-conversation may be ignored.
+
+**2. The "lost in the middle" effect** — empirically demonstrated: a key fact placed in the middle of a long context is retrieved with significantly lower accuracy than the same fact at the start or end.
+
+```
+Attention weight by position:
+
+HIGH │▓                                            ▓│
+     │ ▓▓                                        ▓▓│
+     │   ▓▓                                    ▓▓  │
+LOW  │     ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓    │
+     └─────────────────────────────────────────────┘
+     START                                       END
+```
+
+**3. Silent truncation** — the raw model API will *reject* a request that exceeds the context limit with a hard error; it does not silently drop tokens. The silent dropping happens one level up: chat frameworks and agent loops that auto-trim old turns to keep requests under the limit. They usually do so **without warning**, so an agent that worked for 10 turns may quietly start ignoring its system prompt on turn 20. Know which layer is managing your history — and whether it tells you when it discards something.
+
+**What this means for agents:**
+
+| Implication | Design response |
+|---|---|
+| Instructions dilute over long conversations | Put critical rules in the system prompt; repeat key constraints as needed |
+| Context fills during long tasks | Implement context management (§12) — summarize and compress old turns |
+| No memory between sessions | Build external memory (§4) — episodic and semantic |
+| Tool results consume context budget | Truncate large tool results before injecting into context |
+
+---
 
 ### Exercises
 - [ ] Use a tokenizer playground — count tokens for 10 inputs; find cases where short text costs more than expected
-- [ ] Run the same prompt at temperature `0`, `0.7`, `1.2` — document how output stability changes
-- [ ] Gradually fill a context window and observe when the model starts ignoring early instructions
-- [ ] Find an arithmetic question the model answers wrong confidently — trace why
+- [ ] Run the same prompt at temperature `0`, `0.7`, `1.2` — run each 5 times and document how output stability changes
+- [ ] Gradually fill a context window over many turns and record the approximate point where the model starts ignoring early instructions
+- [ ] Find a comparison or arithmetic question the model answers wrong confidently (e.g. `9.11 vs 9.9`) — determine whether the failure is tokenization or reasoning
 
 ---
 
