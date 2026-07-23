@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field
 
 from dotenv import load_dotenv
 
@@ -15,23 +14,30 @@ load_dotenv(os.path.join(_PROJECT_ROOT, ".env"))
 # --------------------------------------------------------------------------- #
 # Settings
 # --------------------------------------------------------------------------- #
-@dataclass(frozen=True)
 class Settings:
     """Static configuration shared across every exercise."""
 
-    # The Gemini model to use. Swap freely while experimenting.
-    #   - gemini-2.5-flash : fast + cheap, good default for exercises
-    #   - gemini-2.5-pro   : stronger reasoning, slower + costlier
-    model: str = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+    def __init__(self) -> None:
+        # The Gemini model to use. Swap freely while experimenting.
+        #   - models/gemini-2.0-flash : fast, free-tier available
+        #   - models/gemini-2.5-pro   : stronger reasoning, paid only
+        self.model: str = os.getenv("GEMINI_MODEL", "models/gemini-2.0-flash")
 
-    # API key is read from the environment; kept out of source control.
-    api_key: str = field(default_factory=lambda: os.getenv("GEMINI_API_KEY", ""))
+        # API key is read from the environment; kept out of source control.
+        self.api_key: str = os.getenv("GEMINI_API_KEY", "")
 
-    # Default sampling parameters. Individual exercises override these
-    # (e.g. exercise 2 sweeps temperature explicitly).
-    temperature: float = float(os.getenv("GEMINI_TEMPERATURE", "0.7"))
-    top_p: float = float(os.getenv("GEMINI_TOP_P", "0.95"))
-    max_output_tokens: int = int(os.getenv("GEMINI_MAX_OUTPUT_TOKENS", "1024"))
+        # Default sampling parameters. Individual exercises override these
+        # (e.g. exercise 2 sweeps temperature explicitly).
+        self.temperature: float = float(os.getenv("GEMINI_TEMPERATURE", "0.7"))
+        self.top_p: float = float(os.getenv("GEMINI_TOP_P", "0.95"))
+        self.top_k: int = int(os.getenv("GEMINI_TOP_K", "40"))
+        self.max_output_tokens: int = int(os.getenv("GEMINI_MAX_OUTPUT_TOKENS", "1024"))
+
+        # Optional fixed seed for reproducible runs. None (default) = stochastic;
+        # set GEMINI_SEED to an int to make same input → same output.
+        self.seed: int | None = (
+            int(os.environ["GEMINI_SEED"]) if os.getenv("GEMINI_SEED") else None
+        )
 
     def require_api_key(self) -> str:
         """Return the API key or raise a clear error if it is missing."""
